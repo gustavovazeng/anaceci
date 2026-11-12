@@ -621,6 +621,14 @@ const shortLbl = p => (p&&(p.short||(p.label||"").split(" ")[0]))||"";   // nome
 // Pagamentos com "Payment method" = free (acesso liberado/teste, valor USD 0)
 // não contam como venda.
 const WHOP_IGNORAR_GRATIS = true;
+// ── Atribuição de vendas por anúncio / campanha / temperatura ────────────
+// true  → usa as compras do GERENCIADOR (coluna "Action Omni Purchase" da Base
+//         meta) para dividir as vendas por anúncio, campanha e temperatura,
+//         enquanto as vendas do Whop não trazem UTM/xcod. O valor de cada venda
+//         do gerenciador = ticket médio real do dia no Whop (ou META_TICKET).
+//         Total de vendas, faturamento e CPV geral continuam vindo do Whop.
+// false → volta a atribuir pela UTM (xcod → Ad Id) de cada venda do Whop.
+const ATRIBUICAO_GERENCIADOR = true;
 // Fuso usado para o dia da venda (mesmo padrão do Whop Reto: UTC-6, México)
 const VENDAS_UTC_OFFSET_H = -6;
 
@@ -1458,6 +1466,26 @@ async function loadData(force=false){
         vByAdDate[adId][d].qtd+=1; vByAdDate[adId][d].valor+=valor;
       }
     }
+    // ATRIBUICAO_GERENCIADOR: troca as vendas por anúncio (que viriam do xcod)
+    // pelas compras do gerenciador. Daqui em diante tudo que é por anúncio,
+    // campanha ou temperatura (tabelas de Anúncios, filtro de temperatura,
+    // Resumo diário) usa esses números. Total de vendas segue sendo o Whop.
+    if(ATRIBUICAO_GERENCIADOR){
+      for(const k in vByAd) delete vByAd[k];
+      for(const k in vByAdDate) delete vByAdDate[k];
+      const _ticketDia=d=>(vD[d]&&vD[d].qtd>0)?vD[d].valor/vD[d].qtd:META_TICKET;
+      for(const r of parseSheet(mj)){
+        const d=toISO(r["Date"]); if(!d) continue;
+        const adId=r["Ad ID"]||r["Ad Id"]||""; if(!adId) continue;
+        const q=piS(r["Action Omni Purchase"]); if(!q) continue;
+        const val=q*_ticketDia(d);
+        if(!vByAd[adId]) vByAd[adId]={qtd:0,valor:0,taxa:0};
+        vByAd[adId].qtd+=q; vByAd[adId].valor+=val;
+        if(!vByAdDate[adId]) vByAdDate[adId]={};
+        if(!vByAdDate[adId][d]) vByAdDate[adId][d]={qtd:0,valor:0,taxa:0};
+        vByAdDate[adId][d].qtd+=q; vByAdDate[adId][d].valor+=val;
+      }
+    }
     const vByPlatform={}, vByPlacement={};
     for(const r of retoRows){
       if(r["Status da compra"]!=="Paga") continue;
@@ -1488,6 +1516,24 @@ async function loadData(force=false){
         vByTemp[temp][d].taxa  += vv.taxa||0;
       }
     }
+    // Fallback (B Ready): o export do Whop não traz o xcod, então a venda não
+    // chega com Ad Id. Se no dia só UMA temperatura teve investimento, as vendas
+    // sem anúncio identificado vão para ela (atribuição exata). Com mais de uma
+    // temperatura rodando no dia, ficam sem atribuir — não há como saber.
+    // Quando o xcod passar a vir, a atribuição por anúncio acima tem prioridade.
+    const _tempUnica=d=>{
+      const ts=["frio","morno","quente"].filter(t=>(mDByTemp[t][d]?.spend||0)>0);
+      return ts.length===1?ts[0]:null;
+    };
+    if(!ATRIBUICAO_GERENCIADOR) for(const r of retoRows){
+      if(r["Status da compra"]!=="Paga") continue;
+      const adId=r["Ad Id"];
+      if(adId&&mByAdId[adId]&&extractTempFromCamp(mByAdId[adId].campName)) continue; // já atribuída
+      const d=r["Data da compra"]; const temp=_tempUnica(d); if(!temp) continue;
+      const valor=parseFloat(r["Valor do produto"])||0;
+      if(!vByTemp[temp][d]) vByTemp[temp][d]={qtd:0,valor:0,taxa:0};
+      vByTemp[temp][d].qtd+=1; vByTemp[temp][d].valor+=valor;
+    }
     S.vendasByTemp=vByTemp;
 
     // ── Funil: front-end + ascensões (cruzamento por comprador é feito
@@ -1498,9 +1544,10 @@ async function loadData(force=false){
       const buyerTemp={};
       for(const r of retoRows){
         if(r["Status da compra"]!=="Paga") continue;
-        const adId=r["Ad Id"]; if(!adId) continue;
-        const adData=mByAdId[adId]; if(!adData) continue;
-        const temp=extractTempFromCamp(adData.campName); if(!temp) continue;
+        const adId=r["Ad Id"]; const adData=adId?mByAdId[adId]:null;
+        let temp=adData?extractTempFromCamp(adData.campName):null;
+        if(!temp) temp=_tempUnica(r["Data da compra"]);   // fallback sem xcod (ver acima)
+        if(!temp) continue;
         const em=(r["Email"]||"").toLowerCase().trim();
         const cpf=(r["CPF Comprador"]||"").replace(/[^\d]/g,"");
         if(em)  buyerTemp["e:"+em]=temp;
