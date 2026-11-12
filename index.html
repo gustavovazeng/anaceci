@@ -1621,26 +1621,28 @@ function getDailyT(start,end){
     const ctr   = m.impressions>0 ? (m.clicks/m.impressions)*100 : 0;
     const cpm   = m.impressions>0 ? (m.spend/m.impressions)*1000 : 0;
     const txPagChk = m.landingViews>0 ? (m.checkouts/m.landingViews)*100 : 0;
-    const txChkVnd = m.checkouts>0    ? (v.qtd/m.checkouts)*100           : 0;
+    // ATRIBUICAO_GERENCIADOR: compras do gerenciador no numerador (mesma fonte dos checkouts)
+    const _cmp = ATRIBUICAO_GERENCIADOR ? (m.purchases||0) : v.qtd;
+    const txChkVnd = m.checkouts>0    ? (_cmp/m.checkouts)*100            : 0;
     const connect  = m.clicks>0       ? (m.landingViews/m.clicks)*100     : 0;
     return{date,label:fDate(date),spend:m.spend,cpv:v.qtd>0?m.spend/v.qtd:0,
       cpc,ctr,cpm,txPagChk,txChkVnd,connect,
       clicks:m.clicks,impressions:m.impressions,landingViews:m.landingViews,
-      checkouts:m.checkouts,vendas:v.qtd};
+      checkouts:m.checkouts,vendas:v.qtd,compras:_cmp};
   });
 }
 function getTotalsT(daily){
   const t=daily.reduce((a,d)=>({spend:a.spend+d.spend,clicks:a.clicks+d.clicks,
     impressions:a.impressions+d.impressions,landingViews:a.landingViews+d.landingViews,
-    checkouts:a.checkouts+d.checkouts,vendas:a.vendas+d.vendas}),
-    {spend:0,clicks:0,impressions:0,landingViews:0,checkouts:0,vendas:0});
+    checkouts:a.checkouts+d.checkouts,vendas:a.vendas+d.vendas,compras:a.compras+(d.compras??d.vendas)}),
+    {spend:0,clicks:0,impressions:0,landingViews:0,checkouts:0,vendas:0,compras:0});
   return{...t,
     cpv: t.vendas>0 ? t.spend/t.vendas : 0,
     cpc:   t.clicks>0       ? t.spend/t.clicks              : 0,
     ctr:   t.impressions>0  ? (t.clicks/t.impressions)*100  : 0,
     cpm:   t.impressions>0  ? (t.spend/t.impressions)*1000  : 0,
     txPagChk: t.landingViews>0 ? (t.checkouts/t.landingViews)*100 : 0,
-    txChkVnd: t.checkouts>0    ? (t.vendas/t.checkouts)*100       : 0,
+    txChkVnd: t.checkouts>0    ? (t.compras/t.checkouts)*100      : 0,
     connect:  t.clicks>0       ? (t.landingViews/t.clicks)*100    : 0,
   };
 }
@@ -1655,7 +1657,7 @@ function getDayMetrics(iso){
     ctr:   m.impressions>0  ? (m.clicks/m.impressions)*100  : 0,
     cpm:   m.impressions>0  ? (m.spend/m.impressions)*1000  : 0,
     txPagChk: m.landingViews>0 ? (m.checkouts/m.landingViews)*100 : 0,
-    txChkVnd: m.checkouts>0    ? (v.qtd/m.checkouts)*100          : 0,
+    txChkVnd: m.checkouts>0    ? ((ATRIBUICAO_GERENCIADOR?(m.purchases||0):v.qtd)/m.checkouts)*100 : 0,
     connect:  m.clicks>0       ? (m.landingViews/m.clicks)*100    : 0,
     cpv:   v.qtd>0             ? m.spend/v.qtd                    : 0,
     vendas: v.qtd,
