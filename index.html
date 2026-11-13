@@ -582,6 +582,7 @@ const SHEET_ID     = "18ELlonLKzH7hxov92k5YggvKMT-Z5V9nMTC9atdnHis";   // planil
 const GAPI_KEY  = "AIzaSyDFyD63YrWNWSX2gjZWdVD5Bq8uoazXzbE";
 const SHEET_META = "Base meta - BR";        // dados do gerenciador (Meta Ads) — conta CA01 - Dra Ana (USD)
 const SHEET_WHOP = "Base vendas - Whop";    // vendas Whop do B Ready (export padrão do Whop)
+const SHEET_WHOP_ACOMP = "Base vendas Acomp - Whop";  // upsell 1: Acompañamiento B-ready (export padrão do Whop)
 
 // Nome do dashboard (usado nos títulos e nos resumos copiáveis)
 const FUNIL_NOME = "Dra Ana - B Ready";
@@ -593,8 +594,8 @@ const FUNIL_NOME = "Dra Ana - B Ready";
 //   • hotmart → "offers" = código da oferta (data.purchase.offer.code)
 // Front-end com "offers" vazio aceita todas as linhas da aba.
 //
-// UPSELLS (ascensões): ainda não existem no B Ready. Ficam aqui guardados,
-// sem aba e sem oferta, e por isso não aparecem em lugar nenhum. Para ativar:
+// UPSELLS (ascensões): upsell 1 = Acompañamiento B-ready (ativo). O upsell 2
+// fica guardado, sem aba e sem oferta, e por isso não aparece. Para ativar:
 // preencha label, sheet, plataforma e offers do upsell — nada mais precisa
 // mudar. Quem comprou o front é cruzado com a compra do upsell por e-mail ou
 // telefone (o "procv"), e as colunas de take rate / ROAS total aparecem
@@ -604,7 +605,7 @@ const FUNIL_NOME = "Dra Ana - B Ready";
 const ASCENSOES_ATIVAS = true;
 const FUNIL_PRODUTOS = [
   {id:"front", label:"B Ready",   short:"B Ready",  step:"Entrada (Front-end)", fill:"#1d4ed8", text:"#dbeafe", sheet:SHEET_WHOP, plataforma:"whop", offers:["prod_wNNYtHrPsf4YL"]},
-  {id:"asc1",  label:"Upsell 1",  short:"Upsell 1", step:"Upsell 1",            fill:"#92400e", text:"#fef3c7", sheet:"",         plataforma:"whop", offers:[]},
+  {id:"asc1",  label:"Acompañamiento B-ready", short:"Acompañamiento", step:"Upsell 1", fill:"#92400e", text:"#fef3c7", sheet:SHEET_WHOP_ACOMP, plataforma:"whop", offers:["prod_xS8dyR3D1nDnp"]},
   {id:"asc2",  label:"Upsell 2",  short:"Upsell 2", step:"Upsell 2",            fill:"#065f46", text:"#d1fae5", sheet:"",         plataforma:"whop", offers:[]},
 ];
 const FRONT_ID = FUNIL_PRODUTOS[0].id;
