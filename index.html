@@ -583,6 +583,13 @@ const GAPI_KEY  = "AIzaSyDFyD63YrWNWSX2gjZWdVD5Bq8uoazXzbE";
 const SHEET_META = "Base meta - BR";        // dados do gerenciador (Meta Ads) — conta CA01 - Dra Ana (USD)
 const SHEET_WHOP = "Base vendas - Whop";    // vendas Whop do B Ready (export padrão do Whop)
 const SHEET_WHOP_ACOMP = "Base vendas Acomp - Whop";  // upsell 1: Acompañamiento B-ready (export padrão do Whop)
+// Aba AUTOMATIZADA (webhook do Whop): cai venda de TODOS os produtos do Whop
+// (B Ready, Acompañamiento, Reto, Cero…). Cada produto do funil lê dela só o
+// próprio Product ID ("offers"). Pagamento que já está numa exportação manual
+// (mesmo ID pay_…) é descartado daqui — a manual tem prioridade (traz
+// reembolso / forma de pagamento) e nada é contado em dobro.
+const SHEET_WHOP_AUTO = "Base vendas - Whop - automatizado";
+const WHOP_AUTOMACAO_ATIVA = true;
 
 // Nome do dashboard (usado nos títulos e nos resumos copiáveis)
 const FUNIL_NOME = "Dra Ana - B Ready";
@@ -610,7 +617,9 @@ const FUNIL_PRODUTOS = [
 ];
 const FRONT_ID = FUNIL_PRODUTOS[0].id;
 // Entram no funil o front-end e as ascensões já configuradas (aba + oferta).
-const FUNIL_ATIVO = FUNIL_PRODUTOS.filter(p=>p.id===FRONT_ID||(ASCENSOES_ATIVAS&&p.sheet&&p.offers.length));
+// (produto Whop pode vir só da aba automatizada: basta o Product ID em offers)
+const _temFonte = p => p.sheet || (p.plataforma==="whop" && WHOP_AUTOMACAO_ATIVA);
+const FUNIL_ATIVO = FUNIL_PRODUTOS.filter(p=>p.id===FRONT_ID||(ASCENSOES_ATIVAS&&_temFonte(p)&&p.offers.length));
 const ASC_ATIVAS = FUNIL_ATIVO.slice(1);   // ascensões em uso, na ordem
 const TEM_ASC = ASC_ATIVAS.length>0;
 const ASC1 = ASC_ATIVAS[0], ASC2 = ASC_ATIVAS[1];
@@ -1229,6 +1238,58 @@ function parseWhopExportRows(sheetJ){
   return out;
 }
 
+// ── parseWhopWebhookRows: aba automatizada (webhook payment.succeeded) ──────
+// Colunas: type, data.id, data.status, data.paid_at, data.total, data.currency,
+// data.customer_phone, data.product.id, data.product.title, data.user.email,
+// data.metadata.phone (e as equivalentes data.payment.*). Remove repetidos pelo ID.
+function parseWhopWebhookRows(sheetJ){
+  const out=[], seen=new Set();
+  for(const r of parseSheetFirstWins(sheetJ)){
+    const tipo=(r["type"]||"").toLowerCase().trim();
+    if(tipo && tipo!=="payment.succeeded") continue;
+    const st=(r["data.status"]||"").toLowerCase().trim();
+    if(st && st!=="paid") continue;
+    const id=(r["data.id"]||r["data.payment.id"]||"").trim();
+    if(id){ if(seen.has(id)) continue; seen.add(id); }
+    const paidAt=r["data.paid_at"]||r["data.payment.paid_at"]||"";
+    const ms=new Date(paidAt).getTime(); if(!ms||isNaN(ms)) continue;
+    const d=new Date(ms+VENDAS_UTC_OFFSET_H*60*60*1000).toISOString().split("T")[0];
+    if(d<"2020-01-01") continue;
+    const total=parseFloat(String(r["data.total"]||r["data.payment.total"]||r["data.amount"]||"0").replace(",","."))||0;
+    if(WHOP_IGNORAR_GRATIS && total<=0) continue;
+    const curr=(r["data.currency"]||"USD").toUpperCase().trim();
+    // xcod: procura em qualquer coluna que traga (quando a automação passar a enviar)
+    let xcod=""; for(const k in r){ if(/xcod|url|metadata/i.test(k)&&r[k]){ const x=_whopXcod({URL:r[k]}); if(x){xcod=x;break;} } }
+    const adId=extractAdIdFromXcod(xcod)||"";
+    const {platform:_plat,placement:_plac}=extractXcodMeta(xcod);
+    out.push({
+      "Email":(r["data.user.email"]||r["data.payment.user.email"]||"").toLowerCase().trim(),
+      "CPF Comprador":"",
+      "Telefone":(r["data.customer_phone"]||r["data.metadata.phone"]||r["data.payment.metadata.phone"]||"").replace(/\D/g,""),
+      "Nome":"",
+      "Status da compra":"Paga",
+      "Data da compra":d,
+      "Nome do produto":(r["data.product.title"]||"").trim(),
+      "Valor do produto":toUSD(total,curr).toFixed(2),
+      "Taxa da plataforma":"0",
+      "Ad Id":adId,
+      _src:"whop_auto",platform:_plat,placement:_plac,
+      _orderDate:paidAt, _payId:id,
+      offerCode:(r["data.product.id"]||r["data.payment.product.id"]||"").trim(),
+    });
+  }
+  return out;
+}
+// IDs (pay_…) de TODAS as linhas das exportações manuais do Whop — inclusive as
+// que a dash descarta (free, falhou…) — para a automação nunca recontar.
+function whopIdsManuais(sheets){
+  const ids=new Set();
+  for(const j of sheets) for(const r of parseSheetFirstWins(j||{values:[]})){
+    const id=(r["ID"]||"").trim(); if(id) ids.add(id);
+  }
+  return ids;
+}
+
 // ── Load data ──────────────────────────────────────────────────────────────
 // Busca uma aba em blocos de 5000 linhas para evitar timeout em abas grandes
 // ── CSV parser → mesmo formato que a Sheets API {values:[rows]} ───────────
@@ -1295,8 +1356,9 @@ async function loadData(force=false){
   const _empty={values:[]};
   const _fetchSafe=(tab,col,ps)=>fetchSheetPaged(tab,col,ps).catch(e=>{console.warn(`[sheets] Aba "${tab}" indisponível:`,e.message);return _empty;});
   // Meta + abas de vendas dos produtos ativos (cada aba buscada uma vez só)
-  const _salesTabs=[...new Set(FUNIL_ATIVO.map(p=>p.sheet).filter(Boolean))];
-  const _platOf=t=>(FUNIL_ATIVO.find(p=>p.sheet===t)||{}).plataforma||"hotmart";
+  const _salesTabs=[...new Set([...FUNIL_ATIVO.map(p=>p.sheet).filter(Boolean),
+    ...(WHOP_AUTOMACAO_ATIVA&&FUNIL_ATIVO.some(p=>p.plataforma==="whop")?[SHEET_WHOP_AUTO]:[])])];
+  const _platOf=t=>t===SHEET_WHOP_AUTO?"whop":(FUNIL_ATIVO.find(p=>p.sheet===t)||{}).plataforma||"hotmart";
   const [mj, ..._salesJ] = await Promise.all([
     _fetchSafe(SHEET_META,"Z",5000),
     ..._salesTabs.map(t=>_fetchSafe(t,_platOf(t)==="whop"?"BZ":"Z",5000)),
@@ -1438,13 +1500,26 @@ async function loadData(force=false){
 
     // ── Vendas por produto (só as ofertas configuradas em FUNIL_PRODUTOS) ──
     const _parsedTabs={};
+    // Aba automatizada do Whop: lida uma vez; descarta o que já está nas manuais
+    const _autoWhop=(()=>{
+      if(!WHOP_AUTOMACAO_ATIVA||!salesByTab[SHEET_WHOP_AUTO]) return [];
+      const manuais=_salesTabs.filter(t=>t!==SHEET_WHOP_AUTO&&_platOf(t)==="whop").map(t=>salesByTab[t]);
+      const idsMan=whopIdsManuais(manuais);
+      const todas=parseWhopWebhookRows(salesByTab[SHEET_WHOP_AUTO]);
+      const novas=todas.filter(r=>!r._payId||!idsMan.has(r._payId));
+      console.log(`[whop auto] ${todas.length} pagamentos | ${todas.length-novas.length} já estavam nas exportações manuais | ${novas.length} novos`);
+      return novas;
+    })();
     const rowsOf=p=>{
-      if(!p.sheet) return [];
+      if(!_temFonte(p)) return [];
       if(!p.offers.length&&p.id!==FRONT_ID) return [];
-      const _k=p.sheet+"|"+(p.plataforma||"hotmart");
-      if(!_parsedTabs[_k]) _parsedTabs[_k]=(p.plataforma==="whop"?parseWhopExportRows:parseHotmartRows)(salesByTab[p.sheet]||{values:[]});
       const ok=new Set(p.offers.map(o=>o.toLowerCase()));
-      const rows=_parsedTabs[_k].filter(r=>!ok.size||ok.has((r.offerCode||"").toLowerCase()));
+      const _k=p.sheet+"|"+(p.plataforma||"hotmart");
+      if(p.sheet&&!_parsedTabs[_k]) _parsedTabs[_k]=(p.plataforma==="whop"?parseWhopExportRows:parseHotmartRows)(salesByTab[p.sheet]||{values:[]});
+      if(!_parsedTabs[_k]) _parsedTabs[_k]=[];
+      let rows=_parsedTabs[_k].filter(r=>!ok.size||ok.has((r.offerCode||"").toLowerCase()));
+      // + vendas da automação deste produto (só com Product ID definido — a aba tem outros produtos)
+      if(p.plataforma==="whop"&&ok.size) rows=rows.concat(_autoWhop.filter(r=>ok.has((r.offerCode||"").toLowerCase())));
       if(!rows.length&&_parsedTabs[_k].length)
         console.warn(`[funil] "${p.sheet}" tem ${_parsedTabs[_k].length} linhas, mas nenhuma na oferta ${p.offers.join("/")} — confira o código da oferta e a coluna data.purchase.offer.code`);
       return rows;
