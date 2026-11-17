@@ -638,7 +638,10 @@ const WHOP_IGNORAR_GRATIS = true;
 //         do gerenciador = ticket médio real do dia no Whop (ou META_TICKET).
 //         Total de vendas, faturamento e CPV geral continuam vindo do Whop.
 // false → volta a atribuir pela UTM (xcod → Ad Id) de cada venda do Whop.
-const ATRIBUICAO_GERENCIADOR = true;
+const ATRIBUICAO_GERENCIADOR = false;   // 17/11: URLs com UTM preenchidas → atribuição pela UTM
+// Tabela "Páginas" (aba Métricas tráfego): só conta compradores do B Ready a
+// partir desta data (antes disso a UTM não trazia a página)
+const PAGINAS_DESDE = "2026-11-17";
 // Fuso usado para o dia da venda (mesmo padrão do Whop Reto: UTC-6, México)
 const VENDAS_UTC_OFFSET_H = -6;
 
@@ -1191,6 +1194,36 @@ function _whopDateISO(raw){
   if(!ms||isNaN(ms)) return null;
   return new Date(ms+VENDAS_UTC_OFFSET_H*60*60*1000).toISOString().split("T")[0];
 }
+// ── UTMs da coluna URL (checkoutbuilder) ─────────────────────────────────
+// Formato B Ready: utm_source=FBAds_{placement} · utm_medium={campanha}_id_{id}
+//   utm_campaign=br_{site} · utm_term={conjunto}_id_{id} · utm_content={anúncio}_id_{AD ID}
+// Formato Reto (outro funil): utm_campaign={campanha}|{id} · utm_content={anúncio}|{AD ID}
+//   + xcod. Macros não preenchidas ({{ad.id}}) são ignoradas.
+function whopUtm(url){
+  const vazio={adId:"",campName:"",platform:"",placement:"",page:""};
+  if(!url) return vazio;
+  let q;
+  try{ q=new URL(String(url).trim()).searchParams; }
+  catch(e){ try{ q=new URLSearchParams(String(url).split("?")[1]||""); }catch(e2){ return vazio; } }
+  const g=k=>{ const v=(q.get(k)||"").trim(); return v.includes("{{")?"":v; };
+  const SUF=/(?:_id_|\|)(\d{15,20})$/;
+  // Ad ID: xcod (padrão Hotmart/Reto) → utm_content
+  const xcod=g("xcod");
+  let adId=xcod?(extractAdIdFromXcod(xcod)||""):"";
+  if(!adId){ const m=g("utm_content").match(SUF); if(m) adId=m[1]; }
+  // Campanha: o parâmetro que termina em id — utm_campaign (Reto) ou utm_medium (B Ready)
+  let campName="";
+  for(const k of ["utm_campaign","utm_medium"]){ const v=g(k); if(SUF.test(v)){ campName=v.replace(SUF,""); break; } }
+  // Posicionamento: utm_source "FBAds_Instagram_Stories" ou utm_term (Reto)
+  let placement=g("utm_source").replace(/^FBAds_/i,"");
+  if(!placement||/^FB$/i.test(placement)) placement=SUF.test(g("utm_term"))?"":g("utm_term");
+  const pl=placement.toLowerCase();
+  const platform=pl.includes("instagram")?"instagram":pl.includes("facebook")?"facebook":pl.includes("messenger")?"messenger":pl.includes("audience")?"audience_network":pl.includes("thread")?"threads":"";
+  // Página: utm_campaign "br_fb__clase-v5" → "clase-v5" (tudo depois do "__")
+  const _uc=g("utm_campaign"), _ix=_uc.indexOf("__");
+  const page=_ix>=0?_uc.slice(_ix+2).trim():"";
+  return {adId,campName,platform,placement,page};
+}
 function _whopXcod(r){
   // Procura o xcod na URL do checkout ou no Metadata (quando o Whop passar a enviar)
   const fontes=[r["URL"],r["url"],r["Checkout URL"],r["Metadata"]].filter(Boolean);
@@ -1216,10 +1249,10 @@ function parseWhopExportRows(sheetJ){
     const curr=(r["Payment Currency"]||"USD").toUpperCase();
     const valor=toUSD(sub_,curr);
     const refunded=parseFloat(String(r["Refunded amount"]||"0").replace(",","."))||0;
-    const xcod=_whopXcod(r);
-    const adId=extractAdIdFromXcod(xcod)||"";
-    const {platform:_plat,placement:_plac}=extractXcodMeta(xcod);
+    const _u=whopUtm(r["URL"]||r["url"]||"");
+    const adId=_u.adId, _plat=_u.platform, _plac=_u.placement;
     out.push({
+      _utmCamp:_u.campName, _utmPage:_u.page,
       "Email":(r["Email"]||"").toLowerCase().trim(),
       "CPF Comprador":"",
       "Telefone":(r["Phone number"]||"").replace(/\D/g,""),
@@ -1259,10 +1292,10 @@ function parseWhopWebhookRows(sheetJ){
     if(WHOP_IGNORAR_GRATIS && total<=0) continue;
     const curr=(r["data.currency"]||"USD").toUpperCase().trim();
     // xcod: procura em qualquer coluna que traga (quando a automação passar a enviar)
-    let xcod=""; for(const k in r){ if(/xcod|url|metadata/i.test(k)&&r[k]){ const x=_whopXcod({URL:r[k]}); if(x){xcod=x;break;} } }
-    const adId=extractAdIdFromXcod(xcod)||"";
-    const {platform:_plat,placement:_plac}=extractXcodMeta(xcod);
+    const _u=whopUtm(r["URL"]||r["url"]||"");
+    const adId=_u.adId, _plat=_u.platform, _plac=_u.placement;
     out.push({
+      _utmCamp:_u.campName, _utmPage:_u.page,
       "Email":(r["data.user.email"]||r["data.payment.user.email"]||"").toLowerCase().trim(),
       "CPF Comprador":"",
       "Telefone":(r["data.customer_phone"]||r["data.metadata.phone"]||r["data.payment.metadata.phone"]||"").replace(/\D/g,""),
@@ -1601,11 +1634,24 @@ async function loadData(force=false){
       const ts=["frio","morno","quente"].filter(t=>(mDByTemp[t][d]?.spend||0)>0);
       return ts.length===1?ts[0]:null;
     };
+    // Temperatura de uma venda (modo UTM):
+    //  1. Ad ID da UTM existe na Base meta → campanha do anúncio
+    //  2. campanha da UTM existe na Base meta → nome da campanha
+    //  3. veio com UTM de anúncio/campanha que NÃO está na Base meta (ex.: anúncio
+    //     do Reto em outra conta) → não atribui (seria venda sem investimento)
+    //  4. sem UTM → temperatura única do dia (_tempUnica)
+    const _tempVenda=r=>{
+      const adId=r["Ad Id"], c=r._utmCamp||"";
+      if(adId&&mByAdId[adId]) return extractTempFromCamp(mByAdId[adId].campName);
+      if(c&&mByCamp[c]) return extractTempFromCamp(c);
+      if(adId||c) return null;
+      return _tempUnica(r["Data da compra"]);
+    };
     if(!ATRIBUICAO_GERENCIADOR) for(const r of retoRows){
       if(r["Status da compra"]!=="Paga") continue;
       const adId=r["Ad Id"];
       if(adId&&mByAdId[adId]&&extractTempFromCamp(mByAdId[adId].campName)) continue; // já atribuída
-      const d=r["Data da compra"]; const temp=_tempUnica(d); if(!temp) continue;
+      const d=r["Data da compra"]; const temp=_tempVenda(r); if(!temp) continue;
       const valor=parseFloat(r["Valor do produto"])||0;
       if(!vByTemp[temp][d]) vByTemp[temp][d]={qtd:0,valor:0,taxa:0};
       vByTemp[temp][d].qtd+=1; vByTemp[temp][d].valor+=valor;
@@ -1622,7 +1668,7 @@ async function loadData(force=false){
         if(r["Status da compra"]!=="Paga") continue;
         const adId=r["Ad Id"]; const adData=adId?mByAdId[adId]:null;
         let temp=adData?extractTempFromCamp(adData.campName):null;
-        if(!temp) temp=_tempUnica(r["Data da compra"]);   // fallback sem xcod (ver acima)
+        if(!temp&&!adData) temp=_tempVenda(r);   // campanha da UTM ou temp. única do dia (ver acima)
         if(!temp) continue;
         const em=(r["Email"]||"").toLowerCase().trim();
         const cpf=(r["CPF Comprador"]||"").replace(/[^\d]/g,"");
@@ -2376,6 +2422,77 @@ function renderPrincipal(){
 }
 
 // ── Render Tráfego ─────────────────────────────────────────────────────────
+// ── Tabela de Páginas (aba Métricas tráfego) ─────────────────────────────────
+// Página = utm_campaign depois do "__" (br_fb__clase-v5 → clase-v5).
+// Compradores = compradores ÚNICOS do B Ready (e-mail/telefone) no período do
+// filtro, só a partir de PAGINAS_DESDE. Acessos = digitados à mão, guardados SÓ
+// na memória da página (por período: início|fim|página) — fechou/recarregou,
+// zera. Nada é salvo. % conversão = compradores ÷ acessos.
+const _ACESSOS={};
+function _acessosAll(){ return _ACESSOS; }
+function _acKey(page){ return `${S.startDate||""}|${S.endDate||""}|${page}`; }
+function setAcessos(page,v){
+  const a=_acessosAll(), k=_acKey(page);
+  const n=parseInt(String(v||"").replace(/\D/g,""),10);
+  if(n>0) a[k]=n; else delete a[k];
+  const el=document.getElementById("tbl-paginas"); if(el) el.innerHTML=paginasTableHtml();
+}
+function paginasData(){
+  const ini=(S.startDate&&S.startDate>PAGINAS_DESDE)?S.startDate:PAGINAS_DESDE;
+  const fim=S.endDate||"9999-12-31";
+  const byPage={}, todas=new Set(), semPag=new Set(), tot=new Set();
+  for(const r of (S.funilRows||[])){
+    if(classifyProduct(r["Nome do produto"]||"")!==FRONT_ID) continue;
+    if(r["Status da compra"]!=="Paga") continue;
+    const d=r["Data da compra"]||""; if(d<PAGINAS_DESDE) continue;
+    const pg=r._utmPage||"";
+    if(pg) todas.add(pg);                       // lista todas as páginas desde 17/11
+    if(d<ini||d>fim) continue;
+    const who=(r["Email"]||"").toLowerCase().trim()||(r["Telefone"]||"").replace(/\D/g,"")||r._payId||r._orderDate||Math.random();
+    tot.add(who);
+    if(!pg){ semPag.add(who); continue; }
+    (byPage[pg]=byPage[pg]||new Set()).add(who);
+  }
+  const rows=[...todas].map(page=>({page,compradores:(byPage[page]||new Set()).size}))
+    .sort((a,b)=>b.compradores-a.compradores||a.page.localeCompare(b.page,undefined,{numeric:true}));
+  return {ini,fim,rows,semPag:semPag.size,total:tot.size};
+}
+function paginasTableHtml(){
+  const pd=paginasData(), ac=_acessosAll();
+  const esc=t=>String(t).replace(/&/g,"&amp;").replace(/"/g,"&quot;").replace(/</g,"&lt;");
+  const th=(h,al)=>`<th style="padding:7px 12px;text-align:${al};background:var(--surf);border-bottom:1px solid var(--border);color:var(--hint);font-weight:600;font-size:11px;text-transform:uppercase;letter-spacing:.5px">${h}</th>`;
+  const td="padding:8px 12px;text-align:right;font-family:'JetBrains Mono',monospace";
+  const conv=(c,a)=>a>0?(c/a)*100:null;
+  let sumA=0, sumC=0;
+  const body=pd.rows.map((r,i)=>{
+    const a=ac[_acKey(r.page)]||0; if(a){ sumA+=a; sumC+=r.compradores; }
+    const cv=conv(r.compradores,a);
+    return `<tr style="background:${i%2?"rgba(255,255,255,0.02)":"transparent"}">
+      <td style="padding:8px 12px;color:var(--text);font-family:'JetBrains Mono',monospace">${esc(r.page)}</td>
+      <td style="${td}"><input type="text" inputmode="numeric" data-p="${esc(r.page)}" value="${a||""}" placeholder="digitar"
+        onchange="BREADY.setAcessos(this.dataset.p,this.value)" onkeydown="if(event.key==='Enter')this.blur()"
+        style="width:96px;text-align:right;background:var(--surf);border:1px solid var(--border);border-radius:6px;color:var(--text-strong);padding:4px 8px;font-family:'JetBrains Mono',monospace;font-size:12px"/></td>
+      <td style="${td};color:var(--text-strong);font-weight:600">${r.compradores}</td>
+      <td style="${td};color:${cv===null?"var(--hint)":"var(--text-strong)"};font-weight:600">${cv===null?"—":cv.toFixed(2)+"%"}</td>
+    </tr>`;
+  }).join("");
+  const cvT=conv(sumC,sumA);
+  const totRow=pd.rows.length?`<tr style="border-top:1px solid var(--border)">
+      <td style="padding:8px 12px;color:var(--text-strong);font-weight:600">Total (páginas com acessos)</td>
+      <td style="${td};color:var(--text-strong);font-weight:600">${sumA?sumA.toLocaleString("pt-BR"):"—"}</td>
+      <td style="${td};color:var(--text-strong);font-weight:600">${sumA?sumC:"—"}</td>
+      <td style="${td};color:var(--text-strong);font-weight:600">${cvT===null?"—":cvT.toFixed(2)+"%"}</td></tr>`:"";
+  const vazio=!pd.rows.length?`<tr><td colspan="4" style="padding:14px 12px;color:var(--hint)">Nenhuma venda com página na UTM a partir de ${fDateBR(PAGINAS_DESDE)}.</td></tr>`:"";
+  return `<table style="width:100%;border-collapse:collapse;font-size:12px">
+      <thead><tr>${th("Página","left")}${th("Acessos","right")}${th("Compradores","right")}${th("% conversão","right")}</tr></thead>
+      <tbody>${body}${vazio}${totRow}</tbody></table>
+    <div style="margin-top:8px;font-size:11px;color:var(--hint)">
+      Compradores únicos do B Ready de ${fDateBR(pd.ini)} a ${pd.fim==="9999-12-31"?"hoje":fDateBR(pd.fim)} (vendas antes de ${fDateBR(PAGINAS_DESDE)} não entram)
+      · ${pd.total} compradores no período${pd.semPag?` · ${pd.semPag} sem página na UTM`:""}
+      · acessos digitados não ficam salvos: zeram ao fechar ou recarregar a página
+    </div>`;
+}
+
 function renderTrafego(){
   const el=document.getElementById("page-trafego");if(!el)return;
   const isFeo=S.currentFunil==="feo";
@@ -2584,6 +2701,12 @@ function renderTrafego(){
         </table>
       </div>
 
+    </div>
+
+    <!-- Páginas (utm_campaign depois do "__") -->
+    <div style="margin-top:20px;background:var(--card);border:1px solid var(--border);border-radius:12px;padding:18px 20px">
+      <div class="section-lbl" style="margin-top:0;margin-bottom:10px">Páginas</div>
+      <div id="tbl-paginas">${paginasTableHtml()}</div>
     </div>
         <p class="foot">Base Meta + Base Vendas (Whop) · Google Sheets API v4</p>`;
 
@@ -4647,7 +4770,8 @@ window.BREADY = {
   toggleFunilMenu,
   toggleOverlay,
   tsToISO,
-  yesterdayISO
+  yesterdayISO,
+  setAcessos
 };
 })();
 </script>
